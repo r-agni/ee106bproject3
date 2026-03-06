@@ -7,6 +7,7 @@ import tf2_ros
 import numpy as np
 from geometry_msgs.msg import Twist
 import time
+import threading
 import sys
 import os
 from pathlib import Path
@@ -40,6 +41,7 @@ class TurtleBotController(Node):
         self.declare_parameter("max_lin_accel", 0.18)
         self.declare_parameter("max_ang_accel", 1.2)
         self.declare_parameter("startup_hold_s", 0.5)
+        self.declare_parameter("startup_ramp_s", 1.2)
         self.declare_parameter("use_feedback", False)
         self.declare_parameter("omega_sign", 1.0)
         self.declare_parameter("allow_in_place_turn", False)
@@ -48,6 +50,10 @@ class TurtleBotController(Node):
         self.declare_parameter("straight_omega_deadband", 0.06)
         self.declare_parameter("omega_bias", 0.0)
         self.declare_parameter("control_rate_hz", 20.0)
+        self.declare_parameter("odom_frame", "odom")
+        self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("debug_control", True)
+        self.declare_parameter("debug_every_n_cycles", 10)
 
         self.trajectory_filename = self._resolve_trajectory_path(self.get_parameter("trajectory_file").value)
         self.k_pos = float(self.get_parameter("k_pos").value)
@@ -58,6 +64,7 @@ class TurtleBotController(Node):
         self.max_lin_accel = float(self.get_parameter("max_lin_accel").value)
         self.max_ang_accel = float(self.get_parameter("max_ang_accel").value)
         self.startup_hold_s = float(self.get_parameter("startup_hold_s").value)
+        self.startup_ramp_s = float(self.get_parameter("startup_ramp_s").value)
         self.use_feedback = bool(self.get_parameter("use_feedback").value)
         self.omega_sign = float(self.get_parameter("omega_sign").value)
         self.allow_in_place_turn = bool(self.get_parameter("allow_in_place_turn").value)
@@ -66,7 +73,12 @@ class TurtleBotController(Node):
         self.straight_omega_deadband = float(self.get_parameter("straight_omega_deadband").value)
         self.omega_bias = float(self.get_parameter("omega_bias").value)
         self.control_rate_hz = float(self.get_parameter("control_rate_hz").value)
+        self.odom_frame = str(self.get_parameter("odom_frame").value)
+        self.base_frame = str(self.get_parameter("base_frame").value)
+        self.debug_control = bool(self.get_parameter("debug_control").value)
+        self.debug_every_n_cycles = max(1, int(self.get_parameter("debug_every_n_cycles").value))
         self.mission_started = False
+        self.control_thread = None
 
         # Publisher and TF setup
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
@@ -80,15 +92,17 @@ class TurtleBotController(Node):
 
     def get_current_pose(self):
         try:
-            # Get robot pose (base_link) in odom frame
-            trans = self.tf_buffer.lookup_transform('odom', 'base_link', rclpy.time.Time())
+            # Get robot pose in odom frame.
+            trans = self.tf_buffer.lookup_transform(self.odom_frame, self.base_frame, rclpy.time.Time())
             x = trans.transform.translation.x
             y = trans.transform.translation.y
             q = trans.transform.rotation
             yaw = self.quaternion_to_yaw(q.w, q.x, q.y, q.z)
             return (x, y, yaw)
         except Exception as e:
-            self.get_logger().warn(f"Could not get transform: {e}")
+            self.get_logger().warn(
+                f"Could not get transform {self.odom_frame}->{self.base_frame}: {e}"
+            )
             return None
 
     def timer_callback(self):
@@ -97,8 +111,8 @@ class TurtleBotController(Node):
         # Timer stops so we don't plan again
         self.timer.cancel()
         self.mission_started = True
-
-        self.plan_and_follow()
+        self.control_thread = threading.Thread(target=self.plan_and_follow, daemon=True)
+        self.control_thread.start()
 
     def plan_and_follow(self):
         if self.trajectory_filename is None:
@@ -120,6 +134,11 @@ class TurtleBotController(Node):
             solver_stats=None,
             success=True
         )
+        self.get_logger().info(
+            "Loaded trajectory "
+            f"'{self.trajectory_filename}' with {len(result.x)} states, {len(result.v)} controls, "
+            f"total_time={float(result.total_time):.3f}s, dt={float(result.dt):.4f}s."
+        )
         self.follow_trajectory(result)
 
     def follow_trajectory(self, result):
@@ -139,9 +158,17 @@ class TurtleBotController(Node):
 
         dt = float(result.dt)
         rate_hz = max(5.0, self.control_rate_hz)
-        sleep_dt = 1.0 / rate_hz
+        nominal_cycle_dt = 1.0 / rate_hz
+        if dt < nominal_cycle_dt:
+            self.get_logger().warn(
+                f"Trajectory dt ({dt:.4f}s) is smaller than control period ({nominal_cycle_dt:.4f}s). "
+                "Using trajectory dt for per-step command timing."
+            )
         v_prev = 0.0
         omega_prev = 0.0
+        last_pose = None
+        stale_pose_cycles = 0
+        stale_pose_warned = False
 
         # Force a short zero-velocity startup period.
         hold_steps = max(1, int(round(max(0.0, self.startup_hold_s) * rate_hz)))
@@ -149,7 +176,7 @@ class TurtleBotController(Node):
             if not rclpy.ok():
                 break
             self.pub.publish(Twist())
-            time.sleep(sleep_dt)
+            time.sleep(nominal_cycle_dt)
 
         # Align planned frame to measured start pose in odom to avoid startup spin.
         start_pose = None
@@ -158,7 +185,7 @@ class TurtleBotController(Node):
             start_pose = self.get_current_pose()
             if start_pose is None:
                 self.pub.publish(Twist())
-                time.sleep(sleep_dt)
+                time.sleep(nominal_cycle_dt)
 
         if start_pose is None:
             rot_c, rot_s = 1.0, 0.0
@@ -176,6 +203,14 @@ class TurtleBotController(Node):
             ty = y0_meas - (rot_s * x0_plan + rot_c * y0_plan)
 
         self.get_logger().info(f"Executing {n_controls} control steps (dt={dt:.3f}s).")
+        self.get_logger().info(
+            f"Control mode: {'feedback' if self.use_feedback else 'open_loop'}, "
+            f"rate={rate_hz:.1f}Hz, debug_control={self.debug_control}, "
+            f"debug_every_n_cycles={self.debug_every_n_cycles}, "
+            f"tf={self.odom_frame}->{self.base_frame}."
+        )
+        motion_start_time = time.monotonic()
+        control_cycle = 0
 
         for k in range(n_controls):
             if not rclpy.ok():
@@ -190,25 +225,47 @@ class TurtleBotController(Node):
             v_ff = float(result.v[k])
             omega_ff = float(result.omega[k])
 
-            step_start = time.monotonic()
-            while rclpy.ok() and (time.monotonic() - step_start) < dt:
+            step_end = time.monotonic() + dt
+            while rclpy.ok():
+                now = time.monotonic()
+                remaining = step_end - now
+                if remaining <= 0.0:
+                    break
+                cycle_dt = min(nominal_cycle_dt, remaining)
+
                 pose = self.get_current_pose()
                 cmd = Twist()
 
                 if pose is None:
                     self.pub.publish(cmd)
-                    time.sleep(sleep_dt)
+                    time.sleep(cycle_dt)
                     continue
 
                 x, y, yaw = pose
+                if last_pose is not None:
+                    pose_delta = (
+                        abs(x - last_pose[0]) + abs(y - last_pose[1]) + abs(self.wrap_to_pi(yaw - last_pose[2]))
+                    )
+                    if pose_delta < 1e-4:
+                        stale_pose_cycles += 1
+                    else:
+                        stale_pose_cycles = 0
+                        stale_pose_warned = False
+                last_pose = (x, y, yaw)
+                if stale_pose_cycles > 50 and not stale_pose_warned:
+                    self.get_logger().warn(
+                        "Robot pose appears frozen while commands are being sent. "
+                        f"Check that {self.odom_frame}->{self.base_frame} TF is updating."
+                    )
+                    stale_pose_warned = True
+
                 ex = x_ref - x
                 ey = y_ref - y
+                ex_body = math.cos(yaw) * ex + math.sin(yaw) * ey
+                ey_body = -math.sin(yaw) * ex + math.cos(yaw) * ey
+                theta_err = self.wrap_to_pi(theta_ref - yaw)
                 if self.use_feedback:
                     # Pose error expressed in robot frame for stable unicycle tracking.
-                    ex_body = math.cos(yaw) * ex + math.sin(yaw) * ey
-                    ey_body = -math.sin(yaw) * ex + math.cos(yaw) * ey
-                    theta_err = self.wrap_to_pi(theta_ref - yaw)
-
                     # Feedforward controls from planner + body-frame feedback terms.
                     v_raw = v_ff * math.cos(theta_err) + self.k_pos * ex_body
                     omega_raw = omega_ff + self.k_heading * ey_body + self.k_theta * theta_err
@@ -224,32 +281,64 @@ class TurtleBotController(Node):
                 v_limited = float(np.clip(v_raw, -self.v_max_cmd, self.v_max_cmd))
                 omega_limited = float(np.clip(omega_raw, -self.omega_max_cmd, self.omega_max_cmd))
 
+                if self.startup_ramp_s > 0.0:
+                    elapsed = time.monotonic() - motion_start_time
+                    ramp = self._smoothstep(elapsed / self.startup_ramp_s)
+                else:
+                    ramp = 1.0
+                v_target = ramp * v_limited
+                omega_target = ramp * omega_limited
+
                 # Slew-rate limit to avoid abrupt acceleration.
-                v_step = self.max_lin_accel * sleep_dt
-                omega_step = self.max_ang_accel * sleep_dt
-                v_cmd = self._slew_limit(v_prev, v_limited, v_step)
-                omega_cmd = self._slew_limit(omega_prev, omega_limited, omega_step)
+                v_step = self.max_lin_accel * cycle_dt
+                omega_step = self.max_ang_accel * cycle_dt
+                v_cmd = self._slew_limit(v_prev, v_target, v_step)
+                omega_cmd = self._slew_limit(omega_prev, omega_target, omega_step)
+                straight_zeroed = False
+                inplace_zeroed = False
 
                 # For near-straight segments, suppress yaw to keep wheel speeds matched.
                 if abs(omega_ff) < self.straight_omega_deadband and abs(v_cmd) >= self.min_turn_speed:
                     omega_cmd = 0.0
+                    straight_zeroed = True
 
                 # Prevent spinning in place unless explicitly enabled.
                 if (not self.allow_in_place_turn) and abs(v_cmd) < self.min_turn_speed:
                     omega_cmd = 0.0
+                    inplace_zeroed = True
 
                 # Limit curvature to avoid circular drift: |omega| <= kappa_max * |v|.
                 curvature_bound = self.max_curvature * max(abs(v_cmd), self.min_turn_speed)
-                omega_cmd = float(np.clip(omega_cmd + self.omega_bias, -curvature_bound, curvature_bound))
+                omega_with_bias = omega_cmd + self.omega_bias
+                omega_cmd = float(np.clip(omega_with_bias, -curvature_bound, curvature_bound))
+                curvature_clipped = abs(omega_cmd - omega_with_bias) > 1e-9
                 v_prev, omega_prev = v_cmd, omega_cmd
 
                 cmd.linear.x = float(v_cmd)
                 cmd.angular.z = float(self.omega_sign * omega_cmd)
                 self.pub.publish(cmd)
-                time.sleep(sleep_dt)
+                if self.debug_control and (control_cycle % self.debug_every_n_cycles == 0):
+                    self.get_logger().info(
+                        f"[k={k:03d} cycle={control_cycle:05d}] "
+                        f"ref=({x_ref:.3f},{y_ref:.3f},{theta_ref:.3f}) "
+                        f"pose=({x:.3f},{y:.3f},{yaw:.3f}) "
+                        f"err_world=({ex:.3f},{ey:.3f}) err_body=({ex_body:.3f},{ey_body:.3f},{theta_err:.3f}) "
+                        f"ff=(v={v_ff:.3f},w={omega_ff:.3f}) "
+                        f"raw=(v={v_raw:.3f},w={omega_raw:.3f}) "
+                        f"limited=(v={v_limited:.3f},w={omega_limited:.3f}) "
+                        f"target=(v={v_target:.3f},w={omega_target:.3f}) "
+                        f"cmd=(v={v_cmd:.3f},w={omega_cmd:.3f},pub_w={cmd.angular.z:.3f}) "
+                        f"flags=(straight_zeroed={int(straight_zeroed)},"
+                        f"inplace_zeroed={int(inplace_zeroed)},"
+                        f"curvature_clipped={int(curvature_clipped)})"
+                    )
+                control_cycle += 1
+                time.sleep(cycle_dt)
 
         # Stop the robot after trajectory is done
         self.pub.publish(Twist())
+        if self.debug_control:
+            self.get_logger().info(f"Executed {control_cycle} control cycles in trajectory loop.")
         self.get_logger().info("Trajectory finished.")
 
     # ------------------------------------------------------------------
@@ -278,6 +367,11 @@ class TurtleBotController(Node):
     @staticmethod
     def _slew_limit(previous, target, max_step):
         return previous + float(np.clip(target - previous, -max_step, max_step))
+
+    @staticmethod
+    def _smoothstep(x):
+        x = float(np.clip(x, 0.0, 1.0))
+        return x * x * (3.0 - 2.0 * x)
 
     @staticmethod
     def _resolve_trajectory_path(trajectory_filename):
