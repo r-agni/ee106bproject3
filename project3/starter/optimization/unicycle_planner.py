@@ -31,6 +31,8 @@ class TrackingParams:
     obstacle_buffer: float = 0.1
     Q: np.ndarray = field(default_factory=lambda: np.diag([1.0, 1.0, 0.5]))
     R: np.ndarray = field(default_factory=lambda: np.diag([1.0, 0.5]))
+    P: np.ndarray = field(default_factory=lambda: np.diag([8.0, 8.0, 4.0]))
+    dR: np.ndarray = field(default_factory=lambda: np.diag([8.0, 1.5]))
 
 
 @dataclass
@@ -81,19 +83,52 @@ class UnicyclePlanner:
         T = opti.variable()           # total trajectory time
         dt = T / N                    # derived timestep
 
-        ## TODO: Objective — minimize total trajectory time
+        ## Objective — minimize total trajectory time
+        opti.minimize(T)
 
-        ## TODO: Dynamics constraints — Euler integration of unicycle model
+        ## Dynamics constraints — Euler integration of unicycle model
+        for k in range(N):
+            x_k = X[0, k]
+            y_k = X[1, k]
+            theta_k = X[2, k]
+            v_k = U[0, k]
+            omega_k = U[1, k]
 
-        ## TODO: Boundary constraints — pin start and goal states
+            opti.subject_to(X[0, k + 1] == x_k + dt * v_k * ca.cos(theta_k))
+            opti.subject_to(X[1, k + 1] == y_k + dt * v_k * ca.sin(theta_k))
+            opti.subject_to(X[2, k + 1] == theta_k + dt * omega_k)
 
-        ## TODO: Control bounds — bound v and omega
+        ## Boundary constraints — pin start and goal states
+        start_vec = np.array(start, dtype=float)
+        goal_vec = np.array(goal, dtype=float)
+        opti.subject_to(X[:, 0] == start_vec)
+        opti.subject_to(X[:, N] == goal_vec)
 
-        ## TODO: Time bounds — bound total time T (Force to be positive)
+        ## Control bounds — bound v and omega
+        opti.subject_to(opti.bounded(p.v_min, U[0, :], p.v_max))
+        opti.subject_to(opti.bounded(p.omega_min, U[1, :], p.omega_max))
 
-        ## TODO: Obstacle avoidance — keep all nodes outside each obstacle
+        ## Time bounds — bound total time T (Force to be positive)
+        opti.subject_to(opti.bounded(N * p.dt_min, T, N * p.dt_max))
 
-        ## TODO: Initial guess for T
+        ## Obstacle avoidance — keep all nodes outside each obstacle
+        for obs in obstacles:
+            clearance_sq = (obs.radius + p.obstacle_buffer) ** 2
+            for k in range(N + 1):
+                dx = X[0, k] - obs.cx
+                dy = X[1, k] - obs.cy
+                opti.subject_to(dx * dx + dy * dy >= clearance_sq)
+
+        ## Initial guess for T and trajectory variables
+        opti.set_initial(T, N * p.dt_max)
+        alpha = np.linspace(0.0, 1.0, N + 1)
+        X_init = np.outer(start_vec, (1.0 - alpha)) + np.outer(goal_vec, alpha)
+        opti.set_initial(X, X_init)
+        U_init = np.zeros((2, N))
+        distance = float(np.hypot(goal_vec[0] - start_vec[0], goal_vec[1] - start_vec[1]))
+        nominal_v = distance / max(N * p.dt_max, 1e-6)
+        U_init[0, :] = np.clip(nominal_v, p.v_min, p.v_max)
+        opti.set_initial(U, U_init)
 
         opti.solver(
             "ipopt",
@@ -163,15 +198,60 @@ class UnicycleTrackingPlanner:
         X = opti.variable(3, N + 1)
         U = opti.variable(2, N)
 
-        ## TODO: Objective — quadratic tracking cost with terminal penalty
+        ## Objective — quadratic tracking cost with terminal penalty
+        Q = ca.DM(p.Q)
+        R = ca.DM(p.R)
+        P = ca.DM(p.P)
+        dR = ca.DM(p.dR)
+        xf = ca.DM(np.array(goal, dtype=float).reshape(3, 1))
 
-        ## TODO: Dynamics constraints — Euler integration (dt is fixed here)
+        cost = 0
+        for k in range(N):
+            e_k = X[:, k] - xf
+            u_k = U[:, k]
+            cost += ca.mtimes([e_k.T, Q, e_k]) + ca.mtimes([u_k.T, R, u_k])
+        for k in range(N - 1):
+            du_k = U[:, k + 1] - U[:, k]
+            cost += ca.mtimes([du_k.T, dR, du_k])
+        e_N = X[:, N] - xf
+        cost += ca.mtimes([e_N.T, P, e_N])
+        opti.minimize(cost)
 
-        ## TODO: Boundary constraints — pin start and goal states
+        ## Dynamics constraints — Euler integration (dt is fixed here)
+        for k in range(N):
+            x_k = X[0, k]
+            y_k = X[1, k]
+            theta_k = X[2, k]
+            v_k = U[0, k]
+            omega_k = U[1, k]
 
-        ## TODO: Control bounds — bound v and omega
+            opti.subject_to(X[0, k + 1] == x_k + dt * v_k * ca.cos(theta_k))
+            opti.subject_to(X[1, k + 1] == y_k + dt * v_k * ca.sin(theta_k))
+            opti.subject_to(X[2, k + 1] == theta_k + dt * omega_k)
 
-        ## TODO: Obstacle avoidance — keep all nodes outside each obstacle
+        ## Boundary constraints — pin start and goal states
+        start_vec = np.array(start, dtype=float)
+        goal_vec = np.array(goal, dtype=float)
+        opti.subject_to(X[:, 0] == start_vec)
+        opti.subject_to(X[:, N] == goal_vec)
+
+        ## Control bounds — bound v and omega
+        opti.subject_to(opti.bounded(p.v_min, U[0, :], p.v_max))
+        opti.subject_to(opti.bounded(p.omega_min, U[1, :], p.omega_max))
+        opti.subject_to(U[:, 0] == np.array([0.0, 0.0]))
+
+        ## Obstacle avoidance — keep all nodes outside each obstacle
+        for obs in obstacles:
+            clearance_sq = (obs.radius + p.obstacle_buffer) ** 2
+            for k in range(N + 1):
+                dx = X[0, k] - obs.cx
+                dy = X[1, k] - obs.cy
+                opti.subject_to(dx * dx + dy * dy >= clearance_sq)
+
+        alpha = np.linspace(0.0, 1.0, N + 1)
+        X_init = np.outer(start_vec, (1.0 - alpha)) + np.outer(goal_vec, alpha)
+        opti.set_initial(X, X_init)
+        opti.set_initial(U, np.zeros((2, N)))
 
         opti.solver(
             "ipopt",

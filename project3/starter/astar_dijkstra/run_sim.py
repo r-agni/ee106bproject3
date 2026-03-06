@@ -1,9 +1,17 @@
 import argparse
+import os
+import sys
 import numpy as np
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 from utils.load_map import load_map
-from shortestpath import shortestpath
 from utils.plot_path import plot_path
-from astar import astar
+from astar_dijkstra.shortestpath import shortestpath
+from astar_dijkstra.astar import astar
 
 def main():
     parser = argparse.ArgumentParser(description='Path Planning with Dijkstra/A*')
@@ -25,7 +33,12 @@ def main():
     ## DO NOT MODIFY BELOW THIS LINE
     print('Planning ...')
 
-    map_data = load_map(args.map, args.res, args.margin)
+    map_path = args.map
+    if not os.path.exists(map_path):
+        candidate = _PROJECT_ROOT / args.map
+        map_path = str(candidate)
+
+    map_data = load_map(map_path, args.res, args.margin)
     start = np.array(args.start)
     goal = np.array(args.goal)
 

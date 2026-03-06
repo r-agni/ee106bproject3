@@ -13,3 +13,14 @@ __MACOSX/
 
 # Claude Code
 .claude/
+
+# Python/ROS generated artifacts
+__pycache__/
+*.pyc
+build/
+install/
+log/
+starter/src/build/
+starter/src/install/
+starter/src/log/
+starter/venv/
